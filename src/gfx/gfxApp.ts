@@ -105,17 +105,15 @@ export const initAppGfx = (gfx: GfxCtx, gopt: MustKAPLAYOpt): AppGfxCtx => {
             bgColor = rgb(...gopt.background);
             bgAlpha = gopt.background[3] ?? 1;
         }
-
-        gl.clearColor(
-            bgColor.r / 255,
-            bgColor.g / 255,
-            bgColor.b / 255,
-            bgAlpha ?? 1,
-        );
+        gl.clearColor(bgColor.r / 255, bgColor.g / 255, bgColor.b / 255, bgAlpha ?? 1);
     }
 
     gl.enable(gl.BLEND);
-    gl.clearColor(0, 0, 0, 0);
+    // If no background was provided, default to fully transparent clear color.
+    // Do not unconditionally overwrite the background clear color above.
+    if (!bgColor) {
+        gl.clearColor(0, 0, 0, 0);
+    }
     gl.blendFuncSeparate(
         gl.ONE,
         gl.ONE_MINUS_SRC_ALPHA,

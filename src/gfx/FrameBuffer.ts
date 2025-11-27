@@ -11,6 +11,7 @@ export class FrameBuffer {
     tex: Texture;
     glFramebuffer: WebGLFramebuffer;
     glRenderbuffer: WebGLRenderbuffer;
+    _attached: boolean;
 
     constructor(ctx: GfxCtx, w: number, h: number, opt: TextureOpt = {}) {
         this.ctx = ctx;
@@ -28,22 +29,35 @@ export class FrameBuffer {
         this.glFramebuffer = frameBuffer;
         this.glRenderbuffer = renderBuffer;
 
-        this.bind();
-        gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_STENCIL, w, h);
-        gl.framebufferTexture2D(
-            gl.FRAMEBUFFER,
-            gl.COLOR_ATTACHMENT0,
-            gl.TEXTURE_2D,
-            this.tex.glTex,
-            0,
-        );
-        gl.framebufferRenderbuffer(
-            gl.FRAMEBUFFER,
-            gl.DEPTH_STENCIL_ATTACHMENT,
-            gl.RENDERBUFFER,
-            this.glRenderbuffer,
-        );
-        this.unbind();
+        // If texture storage hasn't been allocated yet (texture defers
+        // allocation until it has valid size or data), postpone attaching
+        // and storage until bind-time. We keep track if attachments are set.
+        this._attached = false;
+        if (this.tex._allocated) {
+            this.bind();
+            gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_STENCIL, w, h);
+            gl.framebufferTexture2D(
+                gl.FRAMEBUFFER,
+                gl.COLOR_ATTACHMENT0,
+                gl.TEXTURE_2D,
+                this.tex.glTex,
+                0,
+            );
+            gl.framebufferRenderbuffer(
+                gl.FRAMEBUFFER,
+                gl.DEPTH_STENCIL_ATTACHMENT,
+                gl.RENDERBUFFER,
+                this.glRenderbuffer,
+            );
+            // Check framebuffer completeness during development to catch issues
+            const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+            if (status !== gl.FRAMEBUFFER_COMPLETE) {
+                // eslint-disable-next-line no-console
+                console.error("Framebuffer incomplete, status=", status);
+            }
+            this.unbind();
+            this._attached = true;
+        }
     }
 
     get width() {
@@ -110,8 +124,38 @@ export class FrameBuffer {
     }
 
     bind() {
-        this.ctx.pushFramebuffer(this.glFramebuffer);
-        this.ctx.pushRenderbuffer(this.glRenderbuffer);
+        const gl = this.ctx.gl;
+        // Attach renderbuffer/texture storage if we deferred it earlier
+        if (!this._attached) {
+            gl.bindFramebuffer(gl.FRAMEBUFFER, this.glFramebuffer);
+            gl.bindRenderbuffer(gl.RENDERBUFFER, this.glRenderbuffer);
+            gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_STENCIL, this.width, this.height);
+            gl.framebufferTexture2D(
+                gl.FRAMEBUFFER,
+                gl.COLOR_ATTACHMENT0,
+                gl.TEXTURE_2D,
+                this.tex.glTex,
+                0,
+            );
+            gl.framebufferRenderbuffer(
+                gl.FRAMEBUFFER,
+                gl.DEPTH_STENCIL_ATTACHMENT,
+                gl.RENDERBUFFER,
+                this.glRenderbuffer,
+            );
+            const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+            if (status !== gl.FRAMEBUFFER_COMPLETE) {
+                // eslint-disable-next-line no-console
+                console.error("Framebuffer incomplete on bind, status=", status);
+            }
+            // restore binds handled by push/pop
+            this._attached = true;
+            gl.bindFramebuffer(gl.FRAMEBUFFER, null as any);
+            gl.bindRenderbuffer(gl.RENDERBUFFER, null as any);
+        }
+
+        this.ctx.pushFramebuffer(this.glFramebuffer as any);
+        this.ctx.pushRenderbuffer(this.glRenderbuffer as any);
         this.ctx.pushViewport({ x: 0, y: 0, w: this.width, h: this.height });
     }
 

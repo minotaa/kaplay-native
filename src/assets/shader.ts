@@ -146,7 +146,7 @@ export class Shader {
     }
 
     bind() {
-        this.ctx.pushProgram(this.glProgram);
+        this.ctx.pushProgram(this.glProgram as any);
     }
 
     unbind() {

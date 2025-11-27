@@ -23,6 +23,7 @@ export class Texture {
     glTex: WebGLTexture;
     width: number;
     height: number;
+    _allocated: boolean;
 
     constructor(ctx: GfxCtx, w: number, h: number, opt: TextureOpt = {}) {
         this.ctx = ctx;
@@ -52,6 +53,11 @@ export class Texture {
 
         this.bind();
 
+        // If width/height are zero, defer allocating storage until we have
+        // valid dimensions (this can happen if the window/context isn't ready
+        // when textures are constructed). We mark allocated when storage is
+        // created.
+        this._allocated = false;
         if (w && h) {
             gl.texImage2D(
                 gl.TEXTURE_2D,
@@ -62,8 +68,9 @@ export class Texture {
                 0,
                 gl.RGBA,
                 gl.UNSIGNED_BYTE,
-                new Int8Array(),
+                null as any,
             );
+            this._allocated = true;
         }
 
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
@@ -88,6 +95,21 @@ export class Texture {
     update(img: ImageSource, x = 0, y = 0) {
         const gl = this.ctx.gl;
         this.bind();
+        // Ensure storage exists before uploading
+        if (!this._allocated) {
+            gl.texImage2D(
+                gl.TEXTURE_2D,
+                0,
+                gl.RGBA,
+                img.width,
+                img.height,
+                0,
+                gl.RGBA,
+                gl.UNSIGNED_BYTE,
+                null as any,
+            );
+            this._allocated = true;
+        }
         const data = typeof img.data == 'function' ? img.data() : img.data;
         gl.texSubImage2D(
             gl.TEXTURE_2D,
@@ -167,7 +189,15 @@ export class BatchRenderer {
         this.maxVertices = maxVertices;
         this.maxIndices = maxIndices;
 
+        console.log('Creating BatchRenderer with:', {
+            maxVertices,
+            maxIndices,
+            vertexBufferSize: maxVertices * 4,
+            indexBufferSize: maxIndices * 4
+        });
+
         const glVBuf = gl.createBuffer();
+        console.log('Buffer created:', glVBuf);
 
         if (!glVBuf) {
             throw new Error("Failed to create vertex buffer");
@@ -175,13 +205,22 @@ export class BatchRenderer {
 
         this.glVBuf = glVBuf;
 
+        // Allocate and initialize the vertex buffer
         ctx.pushArrayBuffer(this.glVBuf);
-        gl.bufferData(gl.ARRAY_BUFFER, maxVertices * 4, gl.DYNAMIC_DRAW);
+        console.log('Buffer bound, about to allocate');
+        gl.bufferData(gl.ARRAY_BUFFER, new ArrayBuffer(maxVertices * 4), gl.DYNAMIC_DRAW);
+        let err = gl.getError();
+        console.log('bufferData error:', err);
         ctx.popArrayBuffer();
 
-        this.glIBuf = gl.createBuffer()!;
+        // Create and allocate the index buffer
+        const glIBuf = gl.createBuffer();
+        if (!glIBuf) {
+            throw new Error("Failed to create index buffer");
+        }
+        this.glIBuf = glIBuf;
         ctx.pushElementArrayBuffer(this.glIBuf);
-        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, maxIndices * 4, gl.DYNAMIC_DRAW);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new ArrayBuffer(maxIndices * 2), gl.DYNAMIC_DRAW);
         ctx.popElementArrayBuffer();
     }
 
@@ -249,8 +288,8 @@ export class BatchRenderer {
                 && !deepEq(this.curUniform, uniform))
             || blend !== this.curBlend
             || fixed !== this.curFixed
-            || this.vqueue.length + vertices.length * this.stride
-                > this.maxVertices
+            // vertices is an array of floats already, so compare directly to maxVertices
+            || this.vqueue.length + vertices.length > this.maxVertices
             || this.iqueue.length + indices.length > this.maxIndices
         ) {
             this.flush(width, height);
@@ -284,47 +323,124 @@ export class BatchRenderer {
 
         const gl = this.ctx.gl;
 
-        // Bind vertex data
+        let err
         this.ctx.pushArrayBuffer(this.glVBuf);
         gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Float32Array(this.vqueue));
+        err = gl.getError(); if (err) console.error('After bufferSubData vertex:', err);
 
-        // Bind index data
         this.ctx.pushElementArrayBuffer(this.glIBuf);
-        gl.bufferSubData(
-            gl.ELEMENT_ARRAY_BUFFER,
-            0,
-            new Uint16Array(this.iqueue),
-        );
+        gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0, new Uint16Array(this.iqueue));
+        err = gl.getError(); if (err) console.error('After bufferSubData index:', err);
 
-        // Set vertex format
         this.ctx.setVertexFormat(this.vertexFormat);
+        err = gl.getError(); if (err) console.error('After setVertexFormat:', err);
 
-        // Bind Shader
         this.curShader.bind();
+        err = gl.getError(); if (err) console.error('After shader.bind:', err);
 
-        // Send user uniforms
         if (this.curUniform) {
             this.curShader.send(this.curUniform);
+            err = gl.getError(); if (err) console.error('After send uniform:', err);
         }
 
-        // Send system uniforms
         this.curShader.send({
-            width,
-            height,
+            width, height,
             camera: this.curFixed ? IDENTITY_MATRIX : getCamTransform(),
             transform: IDENTITY_MATRIX,
         });
+        err = gl.getError(); if (err) console.error('After send system uniforms:', err);
 
-        // Bind texture
         this.curTex?.bind();
+        err = gl.getError(); if (err) console.error('After texture bind:', err);
 
         // Draw vertex buffer using active indices
+        // Debug: check buffer sizes in case of potential overruns
+        const arrayBufSize = gl.getBufferParameter
+            ? gl.getBufferParameter(gl.ARRAY_BUFFER, gl.BUFFER_SIZE)
+            : null;
+        const elemBufSize = gl.getBufferParameter
+            ? gl.getBufferParameter(gl.ELEMENT_ARRAY_BUFFER, gl.BUFFER_SIZE)
+            : null;
+
+        // Quick safety checks: ensure the GPU buffers are large enough
+        const requiredArrayBytes = this.vqueue.length * 4; // floats -> bytes
+        const requiredElemBytes = this.iqueue.length * 2; // uint16 -> bytes
+        if ((arrayBufSize !== null && arrayBufSize < requiredArrayBytes)
+            || (elemBufSize !== null && elemBufSize < requiredElemBytes)) {
+            // eslint-disable-next-line no-console
+            console.error("Insufficient GL buffer size before drawElements", {
+                arrayBufSize,
+                elemBufSize,
+                requiredArrayBytes,
+                requiredElemBytes,
+                vqueueLen: this.vqueue.length,
+                iqueueLen: this.iqueue.length,
+            });
+            // Avoid issuing draw call that will generate INVALID_OPERATION
+            this.ctx.popArrayBuffer();
+            this.ctx.popElementArrayBuffer();
+            return;
+        }
+
         gl.drawElements(
             this.curPrimitive,
             this.iqueue.length,
             gl.UNSIGNED_SHORT,
             0,
         );
+
+        // Debug: check for GL errors immediately after issuing draw call
+        err = gl.getError && gl.getError();
+        if (err && err !== 0) {
+            // Collect more debug info to help root cause
+            const numVerts = this.vqueue.length / this.stride;
+            const numIndices = this.iqueue.length;
+            let maxIndex = -1;
+            for (let i = 0; i < this.iqueue.length; i++) {
+                if (this.iqueue[i] > maxIndex) maxIndex = this.iqueue[i];
+            }
+            const arrayBufBinding = gl.getParameter
+                ? gl.getParameter(gl.ARRAY_BUFFER_BINDING)
+                : null;
+            const elemBufBinding = gl.getParameter
+                ? gl.getParameter(gl.ELEMENT_ARRAY_BUFFER_BINDING)
+                : null;
+            const attrStates: any[] = [];
+            try {
+                for (let ai = 0; ai < this.vertexFormat.length; ai++) {
+                    attrStates.push({
+                        index: ai,
+                        enabled: gl.getVertexAttrib(ai, gl.VERTEX_ATTRIB_ARRAY_ENABLED),
+                        size: gl.getVertexAttrib(ai, gl.VERTEX_ATTRIB_ARRAY_SIZE),
+                        stride: gl.getVertexAttrib(ai, gl.VERTEX_ATTRIB_ARRAY_STRIDE),
+                        bufferBinding: gl.getVertexAttrib(ai, gl.VERTEX_ATTRIB_ARRAY_BUFFER_BINDING),
+                        pointer: gl.getVertexAttribOffset ? gl.getVertexAttribOffset(ai, gl.VERTEX_ATTRIB_ARRAY_POINTER) : null,
+                    });
+                }
+            } catch (e) {
+                // some implementations might not support all queries; ignore
+            }
+            // eslint-disable-next-line no-console
+            console.error("WebGL error after drawElements:", err, {
+                primitive: this.curPrimitive,
+                shader: this.curShader?.glProgram ?? this.curShader,
+                tex: this.curTex?.glTex ?? this.curTex,
+                numVerts,
+                numIndices,
+                stride: this.stride,
+                maxIndex,
+                vqueueLen: this.vqueue.length,
+                iqueueLen: this.iqueue.length,
+                firstVertices: this.vqueue.slice(0, Math.min(32, this.vqueue.length)),
+                firstIndices: this.iqueue.slice(0, Math.min(32, this.iqueue.length)),
+                arrayBufSize,
+                elemBufSize,
+                arrayBufBinding,
+                elemBufBinding,
+                attrStates,
+                activeProgram: gl.getParameter ? gl.getParameter(gl.CURRENT_PROGRAM) : null,
+            });
+        }
 
         // Unbind texture and shader
         this.curTex?.unbind();
@@ -450,9 +566,9 @@ export class Mesh {
         this.ctx.setVertexFormat(this.vertexFormat);
         gl.drawElements(
             primitive ?? gl.TRIANGLES,
-            count ?? this.count,     // count of elements
+            count ?? this.count,      // count of indices
             gl.UNSIGNED_SHORT,
-            index ?? 0,              // byte offset
+            index ?? 0,               // byte offset
         );
         this.ctx.popArrayBuffer();
         this.ctx.popElementArrayBuffer();
@@ -499,6 +615,14 @@ export function initGfx(gl: WebGLRenderingContext, opts: KAPLAYOpt = {}) {
         if (deepEq(fmt, curVertexFormat)) return;
         curVertexFormat = fmt;
         const stride = fmt.reduce((sum, f) => sum + f.size, 0);
+        
+        // Disable all attributes first
+        const maxAttribs = gl.getParameter(gl.MAX_VERTEX_ATTRIBS);
+        for (let i = fmt.length; i < maxAttribs; i++) {
+            gl.disableVertexAttribArray(i);
+        }
+        
+        // Now set up the current format
         fmt.reduce((offset, f, i) => {
             gl.enableVertexAttribArray(i);
             gl.vertexAttribPointer(
@@ -513,41 +637,36 @@ export function initGfx(gl: WebGLRenderingContext, opts: KAPLAYOpt = {}) {
         }, 0);
     }
 
-    const [pushTexture2D, popTexture2D] = genStack<WebGLTexture>((t) => {
-        if (t) gl.bindTexture(gl.TEXTURE_2D, t)
+    const [pushTexture2D, popTexture2D] = genStack<WebGLTexture | null>((t) => {
+        gl.bindTexture(gl.TEXTURE_2D, t || gl.createTexture()!); // Bind dummy if null
     });
 
-    const [pushArrayBuffer, popArrayBuffer] = genStack<WebGLBuffer>((b) => {
-        if (b) gl.bindBuffer(gl.ARRAY_BUFFER, b)
+    const [pushArrayBuffer, popArrayBuffer] = genStack<WebGLBuffer | null>((b) => {
+        // @kmamal/gl might not support null, so we need to track differently
+        // For now, just always bind - never unbind
+        if (b) gl.bindBuffer(gl.ARRAY_BUFFER, b);
     });
 
-    const [pushElementArrayBuffer, popElementArrayBuffer] = genStack<
-        WebGLBuffer
-    >((b) => {
-        if (b) gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, b)
+    const [pushElementArrayBuffer, popElementArrayBuffer] = genStack<WebGLBuffer | null>((b) => {
+        if (b) gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, b);
     });
 
-    const [pushFramebuffer, popFramebuffer] = genStack<WebGLFramebuffer>((b) => {
-        if (b) gl.bindFramebuffer(gl.FRAMEBUFFER, b)
+    const [pushFramebuffer, popFramebuffer] = genStack<WebGLFramebuffer | null>((b) => {
+        if (b) gl.bindFramebuffer(gl.FRAMEBUFFER, b);
     });
 
-    const [pushRenderbuffer, popRenderbuffer] = genStack<WebGLRenderbuffer>((
-        b,
-    ) => {
-        if (b) gl.bindRenderbuffer(gl.RENDERBUFFER, b)
+    const [pushRenderbuffer, popRenderbuffer] = genStack<WebGLRenderbuffer | null>((b) => {
+        if (b) gl.bindRenderbuffer(gl.RENDERBUFFER, b);
     });
 
-    const [pushViewport, popViewport] = genStack<
-        { x: number; y: number; w: number; h: number }
-    >((stack) => {
+    const [pushViewport, popViewport] = genStack<{ x: number; y: number; w: number; h: number } | null>((stack) => {
         if (!stack) return;
         const { x, y, w, h } = stack;
-
         gl.viewport(x, y, w, h);
     });
 
-    const [pushProgram, popProgram] = genStack<WebGLProgram>((p) => {
-        if (p) gl.useProgram(p)
+    const [pushProgram, popProgram] = genStack<WebGLProgram | null>((p) => {
+        if (p) gl.useProgram(p);
     });
 
     pushViewport({
@@ -578,4 +697,71 @@ export function initGfx(gl: WebGLRenderingContext, opts: KAPLAYOpt = {}) {
         popProgram,
         setVertexFormat,
     };
+}
+
+// Debug helper: draw a simple triangle using attribute 0 only. Runs when
+// opts.debugDrawTest is true. Useful to check if basic GL draw calls work
+// outside the batcher and to validate attribute 0 behavior.
+export function debugDrawTest(ggl: ReturnType<typeof initGfx>) {
+    const gl = ggl.gl;
+    try {
+        // Simple passthrough vertex shader (uses attribute 0 as position)
+        const vsrc = `attribute vec2 a_pos;void main(){gl_Position=vec4(a_pos,0.0,1.0);}`;
+        const fsrc = `precision mediump float;void main(){gl_FragColor=vec4(1.0,0.0,1.0,1.0);}`;
+        const prog = gl.createProgram();
+        const vs = gl.createShader(gl.VERTEX_SHADER)!;
+        const fs = gl.createShader(gl.FRAGMENT_SHADER)!;
+        gl.shaderSource(vs, vsrc);
+        gl.shaderSource(fs, fsrc);
+        gl.compileShader(vs);
+        gl.compileShader(fs);
+        gl.attachShader(prog!, vs);
+        gl.attachShader(prog!, fs);
+        // bind attrib 0 to a_pos
+        gl.bindAttribLocation(prog!, 0, "a_pos");
+        gl.linkProgram(prog!);
+        gl.validateProgram(prog!);
+
+        let err = gl.getError();
+        console.log("debugDrawTest: after linkProgram glError=", err);
+
+        const vbuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbuf);
+        err = gl.getError();
+        console.log("debugDrawTest: after bindBuffer glError=", err);
+
+        const verts = new Float32Array([0,0.5, -0.5,-0.5, 0.5,-0.5]);
+        gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+        err = gl.getError();
+        console.log("debugDrawTest: after bufferData glError=", err);
+
+        gl.useProgram(prog!);
+        err = gl.getError();
+        console.log("debugDrawTest: after useProgram glError=", err);
+
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+        err = gl.getError();
+        console.log("debugDrawTest: after vertexAttribPointer glError=", err);
+
+        gl.clearColor(1,0,1,1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        err = gl.getError();
+        console.log("debugDrawTest: after clear glError=", err);
+
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        err = gl.getError();
+        console.log("debugDrawTest: after drawArrays glError=", err);
+
+        // cleanup
+        gl.disableVertexAttribArray(0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null as any);
+        gl.useProgram(null as any);
+        gl.deleteProgram(prog!);
+        gl.deleteShader(vs);
+        gl.deleteShader(fs);
+        gl.deleteBuffer(vbuf!);
+    } catch (e) {
+        console.error("debugDrawTest: exception", e);
+    }
 }
